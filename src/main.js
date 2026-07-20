@@ -1,6 +1,7 @@
 import { BrowserMultiFormatReader } from '@zxing/browser';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import { createWorker, PSM } from 'tesseract.js';
 import './style.css';
 
 const STORAGE_KEY = 'vsr-subtyping-tool-run-v2';
@@ -8,6 +9,8 @@ const dateNow = () => new Date().toLocaleDateString('pt-BR');
 const blankRun = () => ({ extractionKit: '', pcrKit: '', executionDate: dateNow(), extractedBy: '', analyzedBy: '', checkedBy: '', samples: [] });
 let run = loadRun();
 let scannerControls = null;
+let cameraStream = null;
+let ocrWorker = null;
 let deferredInstallPrompt = null;
 
 document.querySelector('#app').innerHTML = `
@@ -35,8 +38,9 @@ document.querySelector('#app').innerHTML = `
       <label for="gal">Número GAL</label>
       <div class="scan-row">
         <input id="gal" inputmode="numeric" autocomplete="off" placeholder="Ex.: 260712000074" maxlength="20" />
-        <button id="scan-button" class="secondary-button">Ler código</button>
+        <button id="photo-button" class="secondary-button photo-button">Fotografar GAL</button>
       </div>
+      <button id="scan-button" class="barcode-link">Tentar código de barras</button>
       <p id="gal-warning" class="warning hidden">Este GAL já está na lista.</p>
       <div class="grid grid-2 ct-grid">
         ${field('ct-a', 'CT VSR-A', 'decimal', 'Ex.: 28,4')}
@@ -65,9 +69,16 @@ document.querySelector('#app').innerHTML = `
   </main>
 
   <dialog id="scanner-dialog">
-    <div class="scanner-header"><div><strong>Ler código GAL</strong><span>Centralize o código de barras</span></div><button id="close-scanner" aria-label="Fechar">×</button></div>
+    <div class="scanner-header"><div><strong id="scanner-title">Fotografar número GAL</strong><span id="scanner-subtitle">Centralize o texto “GAL - 000...”</span></div><button id="close-scanner" aria-label="Fechar">×</button></div>
     <div class="video-wrap"><video id="scanner-video" playsinline muted></video><div class="scan-frame"></div></div>
-    <p id="scanner-message">Mantenha a etiqueta iluminada e o mais plana possível.</p>
+    <p id="scanner-message">Aproxime o tubo até o número ocupar o quadro.</p>
+    <button id="capture-button" class="capture-button">Capturar e reconhecer</button>
+    <div id="photo-result" class="photo-result hidden">
+      <span>Confira o número na imagem ampliada:</span>
+      <img id="ocr-preview" alt="Trecho fotografado da etiqueta GAL" />
+      <input id="ocr-gal-input" inputmode="numeric" maxlength="20" placeholder="Digite ou corrija o GAL" />
+      <div><button id="retry-photo" class="retry-button">Nova foto</button><button id="confirm-photo-gal" class="confirm-button">Usar este GAL</button></div>
+    </div>
   </dialog>
 
   <dialog id="install-dialog" class="help-dialog">
@@ -132,11 +143,37 @@ $('new-run').addEventListener('click', () => {
   run = blankRun(); Object.entries(fields).forEach(([key, input]) => { input.value = run[key]; }); saveRun(); renderSamples();
 });
 
-$('scan-button').addEventListener('click', startScanner);
+$('photo-button').addEventListener('click', startPhotoOcr);
+$('scan-button').addEventListener('click', startBarcodeScanner);
+$('capture-button').addEventListener('click', captureAndRecognizeGal);
+$('retry-photo').addEventListener('click', () => { $('photo-result').classList.add('hidden'); $('capture-button').classList.remove('hidden'); $('scanner-message').textContent = 'Aproxime o tubo até o número ocupar o quadro.'; });
+$('ocr-gal-input').addEventListener('input', (event) => { event.target.value = cleanGal(event.target.value); });
+$('confirm-photo-gal').addEventListener('click', () => {
+  const value = cleanGal($('ocr-gal-input').value);
+  if (value.length < 10) return alert('Confira a imagem e informe o número GAL completo.');
+  $('gal').value = value; $('gal').dispatchEvent(new Event('input')); stopScanner();
+});
 $('close-scanner').addEventListener('click', stopScanner);
-async function startScanner() {
+async function openCamera() {
+  cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+  $('scanner-video').srcObject = cameraStream;
+  await $('scanner-video').play();
+}
+async function startPhotoOcr() {
   $('scanner-dialog').showModal();
-  $('scanner-message').textContent = 'Mantenha a etiqueta iluminada e o mais plana possível.';
+  $('scanner-title').textContent = 'Fotografar número GAL';
+  $('scanner-subtitle').textContent = 'Centralize o texto “GAL - 000...”';
+  $('scanner-message').textContent = 'Aproxime o tubo até o número ocupar o quadro.';
+  $('capture-button').classList.remove('hidden');
+  $('photo-result').classList.add('hidden');
+  try { await openCamera(); } catch { $('scanner-message').textContent = 'Não foi possível abrir a câmera. Verifique a permissão do navegador.'; }
+}
+async function startBarcodeScanner() {
+  $('scanner-dialog').showModal();
+  $('scanner-title').textContent = 'Ler código de barras';
+  $('scanner-subtitle').textContent = 'Centralize as barras dentro do quadro';
+  $('scanner-message').textContent = 'Este modo pode falhar quando a etiqueta estiver dobrada.';
+  $('capture-button').classList.add('hidden');
   try {
     const reader = new BrowserMultiFormatReader(undefined, { delayBetweenScanAttempts: 250 });
     scannerControls = await reader.decodeFromConstraints({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }, $('scanner-video'), (result) => {
@@ -149,8 +186,59 @@ async function startScanner() {
     $('scanner-message').textContent = 'Não foi possível abrir a câmera. Verifique a permissão do navegador e tente novamente.';
   }
 }
+async function captureAndRecognizeGal() {
+  const video = $('scanner-video');
+  if (!video.videoWidth) return;
+  const button = $('capture-button');
+  button.disabled = true;
+  button.textContent = 'Reconhecendo...';
+  $('scanner-message').textContent = 'Preparando a imagem. A primeira leitura pode levar alguns segundos.';
+  try {
+    const cropWidth = Math.round(video.videoWidth * 0.84);
+    const cropHeight = Math.round(video.videoHeight * 0.42);
+    const cropX = Math.round((video.videoWidth - cropWidth) / 2);
+    const cropY = Math.round((video.videoHeight - cropHeight) / 2);
+    const canvas = document.createElement('canvas');
+    const targetWidth = Math.max(1400, cropWidth);
+    canvas.width = targetWidth;
+    canvas.height = Math.round(targetWidth * cropHeight / cropWidth);
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    context.drawImage(video, cropX, cropY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+    for (let index = 0; index < pixels.data.length; index += 4) {
+      const gray = pixels.data[index] * 0.299 + pixels.data[index + 1] * 0.587 + pixels.data[index + 2] * 0.114;
+      const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.65 + 128));
+      pixels.data[index] = pixels.data[index + 1] = pixels.data[index + 2] = contrasted;
+    }
+    context.putImageData(pixels, 0, 0);
+    $('ocr-preview').src = canvas.toDataURL('image/jpeg', 0.9);
+    $('ocr-gal-input').value = '';
+    $('photo-result').classList.remove('hidden');
+    $('capture-button').classList.add('hidden');
+    if (!ocrWorker) {
+      ocrWorker = await createWorker('eng', 1, { logger: ({ status, progress }) => {
+        if (status === 'recognizing text') $('scanner-message').textContent = `Lendo o GAL... ${Math.round(progress * 100)}%`;
+      }});
+      await ocrWorker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT });
+    }
+    const { data: { text } } = await ocrWorker.recognize(canvas);
+    const normalized = text.toUpperCase().replace(/[OQD]/g, '0').replace(/[IL|]/g, '1');
+    const afterGal = normalized.match(/GA1?\s*[-:]?\s*([0-9\s]{10,18})/i)?.[1]?.replace(/\s/g, '');
+    const candidates = normalized.match(/\d{10,14}/g) || [];
+    const value = cleanGal(afterGal || candidates.sort((a, b) => b.length - a.length)[0] || '');
+    $('ocr-gal-input').value = value;
+    $('scanner-message').textContent = value.length >= 10 ? 'Sugestão preenchida. Compare cada dígito com a foto.' : 'A leitura automática não foi segura. Digite o GAL olhando a imagem ampliada.';
+    $('ocr-gal-input').focus();
+  } catch {
+    $('scanner-message').textContent = 'A leitura não foi concluída. Verifique a conexão e tente novamente.';
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Capturar e reconhecer';
+  }
+}
 function stopScanner() {
   scannerControls?.stop(); scannerControls = null;
+  cameraStream?.getTracks().forEach((track) => track.stop()); cameraStream = null;
   $('scanner-video').srcObject?.getTracks().forEach((track) => track.stop());
   $('scanner-dialog').close();
 }
