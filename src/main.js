@@ -182,5 +182,5 @@ $('close-help').addEventListener('click', () => $('install-dialog').close());
 
 function loadRun() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || blankRun(); } catch { return blankRun(); } }
 function saveRun() { localStorage.setItem(STORAGE_KEY, JSON.stringify(run)); }
-if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`));
 renderSamples();
