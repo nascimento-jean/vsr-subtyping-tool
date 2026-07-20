@@ -1,0 +1,11 @@
+node_modules/
+.expo/
+.pnpm-store/
+dist/
+dist-ios/
+web-build/
+*.log
+.DS_Store
+tmp/
+IMG_*.jpg
+MODELO*.pdf
