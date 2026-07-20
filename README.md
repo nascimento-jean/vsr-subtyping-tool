@@ -18,7 +18,7 @@ O aplicativo funciona pelo navegador e pode ser instalado na tela inicial de cel
 6. Informe o CT de **VSR-A** e/ou **VSR-B**.
 7. Toque em **Adicionar à execução**.
 8. Repita o procedimento para as demais amostras.
-9. Preencha os responsáveis e toque em **Gerar e baixar PDF**.
+9. Preencha os responsáveis e toque em **Baixar PDF** ou **Baixar Excel**.
 
 O modo **Tentar código de barras** permanece disponível como alternativa. Para etiquetas dobradas, curvadas ou danificadas, recomenda-se fotografar o texto do GAL e realizar a conferência visual.
 
@@ -49,6 +49,7 @@ Em alguns aparelhos, o próprio Chrome exibe automaticamente o botão **Instalar
 - aviso de GAL duplicado;
 - armazenamento automático no próprio aparelho;
 - geração do relatório em PDF;
+- geração de planilha Excel com abas `Relatório` e `Dados`;
 - funcionamento sem cadastro de usuário.
 
 ## Privacidade e observações

@@ -63,7 +63,10 @@ document.querySelector('#app').innerHTML = `
       </div>
     </section>
 
-    <button id="pdf-button" class="primary-button pdf-button">Gerar e baixar PDF</button>
+    <div class="export-buttons">
+      <button id="pdf-button" class="primary-button pdf-button">Baixar PDF</button>
+      <button id="excel-button" class="primary-button excel-button">Baixar Excel</button>
+    </div>
     <p class="privacy">Os dados permanecem armazenados somente neste aparelho.</p>
     <button id="ios-help" class="ios-help hidden">Como instalar no iPhone?</button>
   </main>
@@ -260,6 +263,80 @@ $('pdf-button').addEventListener('click', () => {
   doc.text(`Conferido por: ${run.checkedBy || '-'}`, 14, end + 14);
   doc.save(`subtipagem-vsr-${new Date().toISOString().slice(0, 10)}.pdf`);
 });
+
+$('excel-button').addEventListener('click', exportExcel);
+async function exportExcel() {
+  if (!run.samples.length) return alert('Adicione ao menos uma amostra antes de gerar o Excel.');
+  const button = $('excel-button');
+  button.disabled = true;
+  button.textContent = 'Gerando Excel...';
+  try {
+    const { default: ExcelJS } = await import('exceljs');
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'VSR Subtyping Tool';
+    workbook.created = new Date();
+    workbook.subject = 'Subtipagem de Vírus Sincicial Respiratório';
+
+    const report = workbook.addWorksheet('Relatório', {
+      views: [{ state: 'frozen', ySplit: 7, showGridLines: false }],
+      pageSetup: { orientation: 'landscape', paperSize: 9, fitToPage: true, fitToWidth: 1, fitToHeight: 0, margins: { left: 0.3, right: 0.3, top: 0.45, bottom: 0.45, header: 0.2, footer: 0.2 } },
+    });
+    report.mergeCells('A1:E1');
+    report.getCell('A1').value = 'LABORATÓRIO CENTRAL DE SAÚDE PÚBLICA - LACEN/AL';
+    report.mergeCells('A2:E2');
+    report.getCell('A2').value = 'SUBTIPAGEM DE VÍRUS SINCICIAL RESPIRATÓRIO';
+    report.getCell('A3').value = 'Kit de extração'; report.getCell('B3').value = run.extractionKit || '-';
+    report.getCell('D3').value = 'Kit de PCR'; report.getCell('E3').value = run.pcrKit || '-';
+    report.getCell('A4').value = 'Data de execução'; report.getCell('B4').value = run.executionDate || '-';
+    report.getCell('D4').value = 'Total de amostras'; report.getCell('E4').value = run.samples.length;
+    report.getRow(7).values = ['Nº', 'GAL', 'VSR-A (CT)', 'VSR-B (CT)', 'Resultado'];
+    run.samples.forEach((sample, index) => report.addRow([index + 1, sample.gal, sample.ctA ? Number(sample.ctA) : null, sample.ctB ? Number(sample.ctB) : null, resultFor(sample)]));
+    const signatureStart = 8 + run.samples.length + 2;
+    report.getCell(`A${signatureStart}`).value = 'Extraído por'; report.getCell(`B${signatureStart}`).value = run.extractedBy || '-';
+    report.getCell(`A${signatureStart + 1}`).value = 'Analisado por'; report.getCell(`B${signatureStart + 1}`).value = run.analyzedBy || '-';
+    report.getCell(`A${signatureStart + 2}`).value = 'Conferido por'; report.getCell(`B${signatureStart + 2}`).value = run.checkedBy || '-';
+
+    report.getColumn(1).width = 8; report.getColumn(2).width = 22; report.getColumn(3).width = 16; report.getColumn(4).width = 16; report.getColumn(5).width = 23;
+    ['A1', 'A2'].forEach((cell, index) => { report.getCell(cell).font = { bold: true, size: index === 0 ? 14 : 12, color: { argb: 'FF0F2940' } }; report.getCell(cell).alignment = { horizontal: 'center', vertical: 'middle' }; });
+    report.getRow(1).height = 25; report.getRow(2).height = 22;
+    ['A3', 'D3', 'A4', 'D4'].forEach((cell) => { report.getCell(cell).font = { bold: true, color: { argb: 'FF475569' } }; });
+    const header = report.getRow(7);
+    header.height = 23;
+    header.eachCell((cell) => { cell.font = { bold: true, color: { argb: 'FFFFFFFF' } }; cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF075985' } }; cell.alignment = { horizontal: 'center', vertical: 'middle' }; });
+    for (let rowNumber = 8; rowNumber < 8 + run.samples.length; rowNumber += 1) {
+      const row = report.getRow(rowNumber);
+      row.eachCell((cell) => { cell.border = { bottom: { style: 'thin', color: { argb: 'FFD9E2EA' } } }; cell.alignment = { vertical: 'middle', horizontal: cell.col === 2 || cell.col === 5 ? 'left' : 'center' }; });
+      row.getCell(2).numFmt = '@'; row.getCell(3).numFmt = '0.00'; row.getCell(4).numFmt = '0.00';
+      if (rowNumber % 2 === 0) row.eachCell((cell) => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F7FA' } }; });
+    }
+    report.autoFilter = { from: 'A7', to: `E${7 + run.samples.length}` };
+    report.printArea = `A1:E${signatureStart + 2}`;
+
+    const data = workbook.addWorksheet('Dados', { views: [{ state: 'frozen', ySplit: 1 }] });
+    data.columns = [
+      { header: 'Número', key: 'number', width: 10 }, { header: 'GAL', key: 'gal', width: 22 },
+      { header: 'VSR-A_CT', key: 'ctA', width: 15 }, { header: 'VSR-B_CT', key: 'ctB', width: 15 },
+      { header: 'Resultado', key: 'result', width: 22 }, { header: 'Data_execução', key: 'date', width: 18 },
+    ];
+    run.samples.forEach((sample, index) => data.addRow({ number: index + 1, gal: sample.gal, ctA: sample.ctA ? Number(sample.ctA) : null, ctB: sample.ctB ? Number(sample.ctB) : null, result: resultFor(sample), date: run.executionDate }));
+    data.getRow(1).eachCell((cell) => { cell.font = { bold: true, color: { argb: 'FFFFFFFF' } }; cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF075985' } }; });
+    data.getColumn('gal').numFmt = '@'; data.getColumn('ctA').numFmt = '0.00'; data.getColumn('ctB').numFmt = '0.00';
+    data.autoFilter = { from: 'A1', to: `F${run.samples.length + 1}` };
+
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `subtipagem-vsr-${new Date().toISOString().slice(0, 10)}.xlsx`;
+    document.body.appendChild(anchor); anchor.click(); anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch {
+    alert('Não foi possível gerar o arquivo Excel. Tente novamente.');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Baixar Excel';
+  }
+}
 
 window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault(); deferredInstallPrompt = event; $('install-button').classList.remove('hidden'); });
 $('install-button').addEventListener('click', async () => { if (!deferredInstallPrompt) return; deferredInstallPrompt.prompt(); await deferredInstallPrompt.userChoice; deferredInstallPrompt = null; $('install-button').classList.add('hidden'); });
