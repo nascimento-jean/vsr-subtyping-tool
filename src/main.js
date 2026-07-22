@@ -282,7 +282,7 @@ async function importFilledForm() {
   try {
     const pages = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
       ? await pdfToCanvases(file, status)
-      : [await imageFileToCanvas(file)];
+      : [{ canvas: await imageFileToCanvas(file), embeddedText: '' }];
     for (let index = 0; index < pages.length; index += 1) {
       status.textContent = `Lendo página ${index + 1} de ${pages.length}...`;
       const rows = await recognizeFormPage(pages[index], index);
@@ -314,7 +314,10 @@ async function pdfToCanvases(file, status) {
     canvas.width = Math.round(viewport.width);
     canvas.height = Math.round(viewport.height);
     await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-    canvases.push(canvas);
+    const textContent = await page.getTextContent();
+    const textItems = textContent.items.map((item) => ({ text: item.str || '', x: item.transform?.[4] || 0, y: item.transform?.[5] || 0 }));
+    const embeddedText = textItems.map((item) => item.text).join(' ');
+    canvases.push({ canvas, embeddedText, textItems });
   }
   return canvases;
 }
@@ -346,13 +349,59 @@ async function getOcrWorker() {
   return ocrWorker;
 }
 
-async function recognizeFormPage(canvas, pageIndex) {
+async function recognizeFormPage(pageData, pageIndex) {
+  const { canvas, embeddedText = '', textItems = [] } = pageData;
   const worker = await getOcrWorker();
   await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT });
   const result = await worker.recognize(canvas, {}, { blocks: true, text: true });
   const words = flattenOcrWords(result.data.blocks || []);
-  const rows = rowsFromPositionedWords(words, canvas.width, canvas.height, pageIndex);
-  return rows.length ? rows : rowsFromPlainText(result.data.text || '', pageIndex);
+  const positionedRows = rowsFromPositionedWords(words, canvas.width, canvas.height, pageIndex);
+  const embeddedRows = mergeRecognizedRows(rowsFromPdfItems(textItems, pageIndex), rowsFromPlainText(embeddedText, pageIndex));
+  let ocrRows = rowsFromPlainText(result.data.text || '', pageIndex);
+
+  if (!embeddedRows.length && deduplicateImportedRows([...positionedRows, ...ocrRows]).length < 25) {
+    $('import-status').textContent = 'Fazendo uma segunda leitura da tabela...';
+    const enhanced = enhanceDocumentCanvas(canvas);
+    await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
+    const secondPass = await worker.recognize(enhanced, {}, { text: true });
+    ocrRows = [...ocrRows, ...rowsFromPlainText(secondPass.data.text || '', pageIndex)];
+  }
+
+  return mergeRecognizedRows([...embeddedRows, ...ocrRows], positionedRows);
+}
+
+function rowsFromPdfItems(items, pageIndex) {
+  const registrations = [];
+  items.forEach((item) => {
+    const matches = item.text.toUpperCase().match(/[0-9OQDIL|]{11,14}/g) || [];
+    matches.forEach((match) => {
+      let gal = normalizedDigits(match);
+      if (gal.length > 12) gal = gal.slice(-12);
+      if (gal.length >= 11) registrations.push({ ...item, gal });
+    });
+  });
+  registrations.sort((a, b) => b.y - a.y || a.x - b.x);
+  return registrations.map((registration, index) => {
+    const sameLine = items.filter((item) => Math.abs(item.y - registration.y) < 7 && item.x > registration.x);
+    const name = sameLine.map((item) => item.text.toUpperCase().replace(/[^A-Z]/g, '')).find((value) => value.length >= 2 && value.length <= 12) || '';
+    return { number: index + 1, gal: registration.gal, name, ctA: '', ctB: '', result: '', page: pageIndex + 1, uncertain: true, order: index };
+  });
+}
+
+function enhanceDocumentCanvas(source) {
+  const canvas = document.createElement('canvas');
+  canvas.width = source.width;
+  canvas.height = source.height;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  context.drawImage(source, 0, 0);
+  const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+  for (let index = 0; index < pixels.data.length; index += 4) {
+    const gray = pixels.data[index] * 0.299 + pixels.data[index + 1] * 0.587 + pixels.data[index + 2] * 0.114;
+    const value = gray < 185 ? Math.max(0, gray * 0.55) : 255;
+    pixels.data[index] = pixels.data[index + 1] = pixels.data[index + 2] = value;
+  }
+  context.putImageData(pixels, 0, 0);
+  return canvas;
 }
 
 function flattenOcrWords(blocks) {
@@ -400,12 +449,35 @@ function readResult(words) {
 }
 
 function rowsFromPlainText(text, pageIndex) {
-  const normalized = text.toUpperCase().replace(/[|]/g, ' ');
-  const pattern = /(\d{11,14})\s+([A-Z]{2,12})/g;
+  const normalized = text.toUpperCase().replace(/[|]/g, ' ').replace(/([0-9OQDIL])\s+(?=[0-9OQDIL])/g, '$1');
+  const pattern = /([0-9OQDIL]{11,14})\s*([A-Z]{2,12})/g;
   const rows = [];
   let match;
-  while ((match = pattern.exec(normalized)) !== null) rows.push({ number: rows.length + 1, gal: match[1], name: match[2], ctA: '', ctB: '', result: '', page: pageIndex + 1, uncertain: true });
+  while ((match = pattern.exec(normalized)) !== null) {
+    let gal = normalizedDigits(match[1]);
+    if (gal.length > 12) gal = gal.slice(-12);
+    if (gal.length < 11) continue;
+    rows.push({ number: rows.length + 1, gal, name: match[2], ctA: '', ctB: '', result: '', page: pageIndex + 1, uncertain: true });
+  }
   return rows;
+}
+
+function mergeRecognizedRows(baseRows, positionedRows) {
+  const byGal = new Map();
+  [...baseRows, ...positionedRows].forEach((row) => {
+    if (!row.gal) return;
+    const current = byGal.get(row.gal);
+    if (!current) {
+      byGal.set(row.gal, { ...row });
+      return;
+    }
+    if (!current.name && row.name) current.name = row.name;
+    if (!current.ctA && row.ctA) current.ctA = row.ctA;
+    if (!current.ctB && row.ctB) current.ctB = row.ctB;
+    if (!current.result && row.result) current.result = row.result;
+    current.uncertain = current.uncertain && row.uncertain;
+  });
+  return [...byGal.values()].sort((a, b) => (a.page || 0) - (b.page || 0) || (a.order ?? a.number ?? 0) - (b.order ?? b.number ?? 0));
 }
 
 function deduplicateImportedRows(rows) {
