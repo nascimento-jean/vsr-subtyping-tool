@@ -2,8 +2,8 @@ import { BrowserMultiFormatReader } from '@zxing/browser';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { createWorker, PSM } from 'tesseract.js';
-import * as pdfjsLib from 'pdfjs-dist';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url';
 import './style.css';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
