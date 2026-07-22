@@ -362,17 +362,100 @@ async function recognizeFormPage(pageData, pageIndex) {
   const embeddedRows = mergeRecognizedRows(rowsFromPdfItems(textItems, pageIndex), rowsFromPlainText(embeddedText, pageIndex));
   let ocrRows = rowsFromPlainText(result.data.text || '', pageIndex);
 
-  if (!embeddedRows.length && deduplicateImportedRows([...positionedRows, ...ocrRows]).length < 25) {
-    $('import-status').textContent = 'Fazendo uma segunda leitura da tabela...';
-    const enhanced = enhanceDocumentCanvas(canvas);
-    await worker.setParameters({ tessedit_pageseg_mode: PSM.AUTO });
-    const secondPass = await worker.recognize(enhanced, {}, { text: true });
-    ocrRows = [...ocrRows, ...rowsFromPlainText(secondPass.data.text || '', pageIndex)];
+  let mergedRows;
+  if (embeddedRows.length) {
+    mergedRows = mergeRecognizedRows([...embeddedRows, ...ocrRows], positionedRows);
+  } else {
+    const tableRows = await recognizeImageTableRows(canvas, worker, result.data.text || '', pageIndex);
+    mergedRows = mergeImageTableRows(tableRows, [...positionedRows, ...ocrRows]);
   }
-
-  const mergedRows = mergeRecognizedRows([...embeddedRows, ...ocrRows], positionedRows);
   await recognizeHandwrittenFields(canvas, mergedRows, worker, pageIndex);
   return mergedRows;
+}
+
+async function recognizeImageTableRows(canvas, worker, fullText, pageIndex) {
+  const continuationPage = !/FORMUL|EXTRAÇÃO|EXTRACAO/i.test(fullText) && /\b3[3-9]\b/.test(fullText);
+  const rowCount = continuationPage ? 15 : 32;
+  const startRatio = continuationPage ? 0.082 : 0.392;
+  const endRatio = continuationPage ? 0.337 : 0.91;
+  const xStart = continuationPage ? 0.09 : 0.10;
+  const xEnd = 0.47;
+  const spacing = (endRatio - startRatio) / Math.max(1, rowCount - 1);
+  const rows = [];
+  await worker.setParameters({
+    tessedit_pageseg_mode: PSM.SINGLE_LINE,
+    tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+  });
+  for (let index = 0; index < rowCount; index += 1) {
+    $('import-status').textContent = `Lendo linha ${index + 1} de ${rowCount} da imagem...`;
+    const rowY = canvas.height * (startRatio + spacing * index);
+    const strip = makePrintedRowStrip(canvas, xStart, xEnd, rowY, canvas.height * spacing * 0.72);
+    const result = await worker.recognize(strip, {}, { text: true });
+    const parsed = parsePrintedRow(result.data.text || '');
+    rows.push({
+      number: index + 1,
+      gal: parsed.gal,
+      name: parsed.name,
+      ctA: '', ctB: '', result: '', page: pageIndex + 1,
+      uncertain: !parsed.gal || !parsed.name,
+      order: index,
+      rowY,
+      placeholder: !parsed.gal,
+    });
+  }
+  await worker.setParameters({ tessedit_char_whitelist: '', tessedit_pageseg_mode: PSM.SPARSE_TEXT });
+  return rows;
+}
+
+function makePrintedRowStrip(source, startRatio, endRatio, centerY, rowHeight) {
+  const x = Math.round(source.width * startRatio);
+  const y = Math.max(0, Math.round(centerY - rowHeight / 2));
+  const width = Math.round(source.width * (endRatio - startRatio));
+  const height = Math.max(8, Math.round(rowHeight));
+  const scale = 2.4;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(width * scale);
+  canvas.height = Math.round(height * scale);
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  context.drawImage(source, x, y, width, height, 0, 0, canvas.width, canvas.height);
+  const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+  for (let offset = 0; offset < pixels.data.length; offset += 4) {
+    const gray = pixels.data[offset] * 0.299 + pixels.data[offset + 1] * 0.587 + pixels.data[offset + 2] * 0.114;
+    const value = gray < 175 ? 0 : 255;
+    pixels.data[offset] = pixels.data[offset + 1] = pixels.data[offset + 2] = value;
+  }
+  context.putImageData(pixels, 0, 0);
+  return canvas;
+}
+
+function parsePrintedRow(text) {
+  const compact = text.toUpperCase().replace(/[^0-9A-Z|]/g, '');
+  const candidateMatches = [...compact.matchAll(/[0-9OQDIL|]{11,14}/g)];
+  const match = candidateMatches.sort((a, b) => normalizedDigits(b[0]).length - normalizedDigits(a[0]).length)[0];
+  let gal = match ? normalizedDigits(match[0]) : '';
+  if (gal.length > 12) gal = gal.slice(-12);
+  const nameSource = match ? compact.slice((match.index || 0) + match[0].length) : compact.replace(/^[0-9]{1,2}/, '');
+  const name = nameSource.replace(/[^A-Z]/g, '').slice(0, 12);
+  return { gal, name };
+}
+
+function mergeImageTableRows(tableRows, recognizedRows) {
+  return tableRows.map((row) => {
+    const candidates = recognizedRows.filter((candidate) => Number.isFinite(candidate.rowY));
+    const nearest = candidates.length ? candidates.reduce((closest, candidate) => Math.abs(candidate.rowY - row.rowY) < Math.abs(closest.rowY - row.rowY) ? candidate : closest, candidates[0]) : null;
+    const tolerance = tableRows.length > 1 ? Math.abs(tableRows[1].rowY - tableRows[0].rowY) * 0.65 : 20;
+    if (!nearest || Math.abs(nearest.rowY - row.rowY) > tolerance) return row;
+    return {
+      ...row,
+      gal: row.gal || nearest.gal || '',
+      name: row.name || nearest.name || '',
+      ctA: nearest.ctA || '',
+      ctB: nearest.ctB || '',
+      result: nearest.result || '',
+      placeholder: !(row.gal || nearest.gal),
+      uncertain: true,
+    };
+  });
 }
 
 async function recognizeHandwrittenFields(canvas, rows, worker, pageIndex) {
@@ -488,22 +571,6 @@ function rowsFromPdfItems(items, pageIndex) {
   });
 }
 
-function enhanceDocumentCanvas(source) {
-  const canvas = document.createElement('canvas');
-  canvas.width = source.width;
-  canvas.height = source.height;
-  const context = canvas.getContext('2d', { willReadFrequently: true });
-  context.drawImage(source, 0, 0);
-  const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
-  for (let index = 0; index < pixels.data.length; index += 4) {
-    const gray = pixels.data[index] * 0.299 + pixels.data[index + 1] * 0.587 + pixels.data[index + 2] * 0.114;
-    const value = gray < 185 ? Math.max(0, gray * 0.55) : 255;
-    pixels.data[index] = pixels.data[index + 1] = pixels.data[index + 2] = value;
-  }
-  context.putImageData(pixels, 0, 0);
-  return canvas;
-}
-
 function flattenOcrWords(blocks) {
   const words = [];
   blocks.forEach((block) => (block.paragraphs || []).forEach((paragraph) =>
@@ -583,7 +650,12 @@ function mergeRecognizedRows(baseRows, positionedRows) {
 
 function deduplicateImportedRows(rows) {
   const seen = new Set();
-  return rows.filter((row) => row.gal && !seen.has(row.gal) && seen.add(row.gal)).map((row, index) => ({ ...row, number: index + 1 }));
+  return rows.filter((row, index) => {
+    const key = row.gal || `blank-${row.page || 0}-${row.order ?? index}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map((row, index) => ({ ...row, number: index + 1 }));
 }
 
 function renderReviewRows() {
