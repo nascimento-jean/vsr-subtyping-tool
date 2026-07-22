@@ -50,8 +50,6 @@ Em alguns aparelhos, o próprio Chrome exibe automaticamente o botão **Instalar
 - armazenamento automático no próprio aparelho;
 - geração do relatório em PDF;
 - geração de planilha Excel com abas `Relatório` e `Dados`;
-- fotografia guiada de uma página completa do formulário;
-- escolha entre a página 1 (32 linhas) e a página 2 (15 linhas);
 - importação de PDF de formulário preenchido;
 - conversão automática de cada página do PDF em imagem no aparelho;
 - revisão dos registros, nomes, CTs e resultados antes da inclusão;
