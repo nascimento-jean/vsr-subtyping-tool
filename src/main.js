@@ -17,6 +17,7 @@ let cameraStream = null;
 let ocrWorker = null;
 let deferredInstallPrompt = null;
 let importedRows = [];
+let cameraMode = 'gal';
 
 document.querySelector('#app').innerHTML = `
   <header class="topbar">
@@ -31,9 +32,9 @@ document.querySelector('#app').innerHTML = `
 
     <section class="panel import-panel">
       <div class="section-heading"><div><span class="step">2</span><h2>Importar formulário preenchido</h2></div><span class="local-badge">Processamento local</span></div>
-      <p class="panel-description">Escolha uma fotografia ou um PDF digitalizado. No PDF, cada página é convertida automaticamente em imagem antes da leitura.</p>
-      <input id="form-file" class="file-input" type="file" accept="image/*,.pdf,application/pdf" />
-      <button id="import-form-button" class="primary-button import-button">Reconhecer imagem ou PDF</button>
+      <p class="panel-description">Importe um PDF digitalizado. Cada página será convertida automaticamente em imagem antes da leitura.</p>
+      <input id="form-file" class="file-input" type="file" accept=".pdf,application/pdf" />
+      <button id="import-form-button" class="primary-button import-button">Importar e reconhecer PDF</button>
       <p id="import-status" class="import-status hidden"></p>
     </section>
 
@@ -54,6 +55,10 @@ document.querySelector('#app').innerHTML = `
         <button id="photo-button" class="secondary-button photo-button">Fotografar GAL</button>
       </div>
       <button id="scan-button" class="barcode-link">Tentar código de barras</button>
+      <div class="full-form-callout">
+        <div><strong>Formulário completo</strong><span>Fotografe uma página inteira da tabela.</span></div>
+        <button id="full-form-photo-button" class="secondary-button">Fotografar formulário</button>
+      </div>
       <p id="gal-warning" class="warning hidden">Este GAL já está na lista.</p>
       <div class="grid grid-2 ct-grid">
         ${field('ct-a', 'CT VSR-A', 'decimal', 'Ex.: 28,4')}
@@ -86,7 +91,8 @@ document.querySelector('#app').innerHTML = `
 
   <dialog id="scanner-dialog">
     <div class="scanner-header"><div><strong id="scanner-title">Fotografar número GAL</strong><span id="scanner-subtitle">Centralize o texto “GAL - 000...”</span></div><button id="close-scanner" aria-label="Fechar">×</button></div>
-    <div class="video-wrap"><video id="scanner-video" playsinline muted></video><div class="scan-frame"></div></div>
+    <div class="video-wrap"><video id="scanner-video" playsinline muted></video><div id="scan-frame" class="scan-frame"></div></div>
+    <div id="form-camera-options" class="form-camera-options hidden"><label for="form-page-type">Página fotografada</label><select id="form-page-type"><option value="32">Página 1 — linhas 1 a 32</option><option value="15">Página 2 — linhas 33 a 47</option></select></div>
     <p id="scanner-message">Aproxime o tubo até o número ocupar o quadro.</p>
     <button id="capture-button" class="capture-button">Capturar e reconhecer</button>
     <div id="photo-result" class="photo-result hidden">
@@ -167,8 +173,9 @@ $('new-run').addEventListener('click', () => {
 });
 
 $('photo-button').addEventListener('click', startPhotoOcr);
+$('full-form-photo-button').addEventListener('click', startFullFormCamera);
 $('scan-button').addEventListener('click', startBarcodeScanner);
-$('capture-button').addEventListener('click', captureAndRecognizeGal);
+$('capture-button').addEventListener('click', () => cameraMode === 'form' ? captureAndRecognizeForm() : captureAndRecognizeGal());
 $('retry-photo').addEventListener('click', () => { $('photo-result').classList.add('hidden'); $('capture-button').classList.remove('hidden'); $('scanner-message').textContent = 'Aproxime o tubo até o número ocupar o quadro.'; });
 $('ocr-gal-input').addEventListener('input', (event) => { event.target.value = cleanGal(event.target.value); });
 $('confirm-photo-gal').addEventListener('click', () => {
@@ -183,20 +190,40 @@ async function openCamera() {
   await $('scanner-video').play();
 }
 async function startPhotoOcr() {
+  cameraMode = 'gal';
   $('scanner-dialog').showModal();
   $('scanner-title').textContent = 'Fotografar número GAL';
   $('scanner-subtitle').textContent = 'Centralize o texto “GAL - 000...”';
   $('scanner-message').textContent = 'Aproxime o tubo até o número ocupar o quadro.';
   $('capture-button').classList.remove('hidden');
+  $('capture-button').textContent = 'Capturar e reconhecer';
   $('photo-result').classList.add('hidden');
+  $('form-camera-options').classList.add('hidden');
+  $('scan-frame').classList.remove('form-frame');
+  try { await openCamera(); } catch { $('scanner-message').textContent = 'Não foi possível abrir a câmera. Verifique a permissão do navegador.'; }
+}
+async function startFullFormCamera() {
+  cameraMode = 'form';
+  $('scanner-dialog').showModal();
+  $('scanner-title').textContent = 'Fotografar formulário completo';
+  $('scanner-subtitle').textContent = 'Alinhe as quatro bordas da folha dentro do guia';
+  $('scanner-message').textContent = 'Use boa iluminação, evite sombras e mantenha a folha completamente plana.';
+  $('capture-button').classList.remove('hidden');
+  $('capture-button').textContent = 'Fotografar e reconhecer formulário';
+  $('photo-result').classList.add('hidden');
+  $('form-camera-options').classList.remove('hidden');
+  $('scan-frame').classList.add('form-frame');
   try { await openCamera(); } catch { $('scanner-message').textContent = 'Não foi possível abrir a câmera. Verifique a permissão do navegador.'; }
 }
 async function startBarcodeScanner() {
+  cameraMode = 'barcode';
   $('scanner-dialog').showModal();
   $('scanner-title').textContent = 'Ler código de barras';
   $('scanner-subtitle').textContent = 'Centralize as barras dentro do quadro';
   $('scanner-message').textContent = 'Este modo pode falhar quando a etiqueta estiver dobrada.';
   $('capture-button').classList.add('hidden');
+  $('form-camera-options').classList.add('hidden');
+  $('scan-frame').classList.remove('form-frame');
   try {
     const reader = new BrowserMultiFormatReader(undefined, { delayBetweenScanAttempts: 250 });
     scannerControls = await reader.decodeFromConstraints({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }, $('scanner-video'), (result) => {
@@ -208,6 +235,55 @@ async function startBarcodeScanner() {
   } catch (error) {
     $('scanner-message').textContent = 'Não foi possível abrir a câmera. Verifique a permissão do navegador e tente novamente.';
   }
+}
+
+async function captureAndRecognizeForm() {
+  const video = $('scanner-video');
+  if (!video.videoWidth) return;
+  const button = $('capture-button');
+  button.disabled = true;
+  button.textContent = 'Preparando fotografia...';
+  importedRows = [];
+  try {
+    const canvas = captureGuideArea(video, $('scan-frame'));
+    cameraStream?.getTracks().forEach((track) => track.stop());
+    cameraStream = null;
+    video.pause();
+    const expectedRows = Number($('form-page-type').value);
+    $('scanner-message').textContent = `Analisando ${expectedRows} linhas. Mantenha esta tela aberta.`;
+    const rows = await recognizeFormPage({ canvas, embeddedText: '', textItems: [], expectedRows }, expectedRows === 15 ? 1 : 0);
+    importedRows = deduplicateImportedRows(rows);
+    renderReviewRows();
+    stopScanner();
+    $('review-dialog').showModal();
+  } catch (error) {
+    console.error(error);
+    $('scanner-message').textContent = `Não foi possível reconhecer o formulário: ${error.message || 'tente novamente.'}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Fotografar e reconhecer formulário';
+  }
+}
+
+function captureGuideArea(video, frame) {
+  const videoRect = video.getBoundingClientRect();
+  const frameRect = frame.getBoundingClientRect();
+  const displayScale = Math.max(videoRect.width / video.videoWidth, videoRect.height / video.videoHeight);
+  const displayedWidth = video.videoWidth * displayScale;
+  const displayedHeight = video.videoHeight * displayScale;
+  const hiddenX = (displayedWidth - videoRect.width) / 2;
+  const hiddenY = (displayedHeight - videoRect.height) / 2;
+  const relativeX = frameRect.left - videoRect.left;
+  const relativeY = frameRect.top - videoRect.top;
+  const sourceX = Math.max(0, Math.round((relativeX + hiddenX) / displayScale));
+  const sourceY = Math.max(0, Math.round((relativeY + hiddenY) / displayScale));
+  const sourceWidth = Math.min(video.videoWidth - sourceX, Math.round(frameRect.width / displayScale));
+  const sourceHeight = Math.min(video.videoHeight - sourceY, Math.round(frameRect.height / displayScale));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1200, sourceWidth);
+  canvas.height = Math.round(canvas.width * sourceHeight / sourceWidth);
+  canvas.getContext('2d').drawImage(video, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
+  return canvas;
 }
 async function captureAndRecognizeGal() {
   const video = $('scanner-video');
@@ -273,16 +349,15 @@ $('confirm-import').addEventListener('click', confirmImportedRows);
 
 async function importFilledForm() {
   const file = $('form-file').files[0];
-  if (!file) return alert('Escolha uma imagem ou um arquivo PDF.');
+  if (!file) return alert('Escolha um arquivo PDF.');
+  if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) return alert('Este campo aceita somente arquivos PDF.');
   const button = $('import-form-button');
   const status = $('import-status');
   button.disabled = true;
   status.classList.remove('hidden');
   importedRows = [];
   try {
-    const pages = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
-      ? await pdfToCanvases(file, status)
-      : [{ canvas: await imageFileToCanvas(file), embeddedText: '' }];
+    const pages = await pdfToCanvases(file, status);
     for (let index = 0; index < pages.length; index += 1) {
       status.textContent = `Lendo página ${index + 1} de ${pages.length}...`;
       const rows = await recognizeFormPage(pages[index], index);
@@ -295,7 +370,7 @@ async function importFilledForm() {
     status.textContent = `${importedRows.length} registro(s) localizado(s). Confira os dados.`;
   } catch (error) {
     console.error(error);
-    status.textContent = `Não foi possível concluir a leitura: ${error.message || 'tente outra imagem.'}`;
+    status.textContent = `Não foi possível concluir a leitura: ${error.message || 'tente novamente.'}`;
   } finally {
     button.disabled = false;
   }
@@ -325,35 +400,20 @@ async function pdfToCanvases(file, status) {
   return canvases;
 }
 
-function imageFileToCanvas(file) {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    const url = URL.createObjectURL(file);
-    image.onload = () => {
-      const maxWidth = 2400;
-      const scale = Math.min(1, maxWidth / image.naturalWidth);
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.round(image.naturalWidth * scale);
-      canvas.height = Math.round(image.naturalHeight * scale);
-      canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
-      URL.revokeObjectURL(url);
-      resolve(canvas);
-    };
-    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Imagem inválida.')); };
-    image.src = url;
-  });
-}
-
 async function getOcrWorker() {
   if (ocrWorker) return ocrWorker;
   ocrWorker = await createWorker('eng', 1, { logger: ({ status, progress }) => {
-    if (status === 'recognizing text') $('import-status').textContent = `Reconhecendo texto... ${Math.round(progress * 100)}%`;
+    if (status === 'recognizing text') {
+      const message = `Reconhecendo texto... ${Math.round(progress * 100)}%`;
+      if ($('scanner-dialog').open && cameraMode === 'form') $('scanner-message').textContent = message;
+      else $('import-status').textContent = message;
+    }
   }});
   return ocrWorker;
 }
 
 async function recognizeFormPage(pageData, pageIndex) {
-  const { canvas, embeddedText = '', textItems = [] } = pageData;
+  const { canvas, embeddedText = '', textItems = [], expectedRows = null } = pageData;
   const worker = await getOcrWorker();
   await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT });
   const result = await worker.recognize(canvas, {}, { blocks: true, text: true });
@@ -366,16 +426,16 @@ async function recognizeFormPage(pageData, pageIndex) {
   if (embeddedRows.length) {
     mergedRows = mergeRecognizedRows([...embeddedRows, ...ocrRows], positionedRows);
   } else {
-    const tableRows = await recognizeImageTableRows(canvas, worker, result.data.text || '', pageIndex);
+    const tableRows = await recognizeImageTableRows(canvas, worker, result.data.text || '', pageIndex, expectedRows);
     mergedRows = mergeImageTableRows(tableRows, [...positionedRows, ...ocrRows]);
   }
   await recognizeHandwrittenFields(canvas, mergedRows, worker, pageIndex);
   return mergedRows;
 }
 
-async function recognizeImageTableRows(canvas, worker, fullText, pageIndex) {
-  const continuationPage = !/FORMUL|EXTRAÇÃO|EXTRACAO/i.test(fullText) && /\b3[3-9]\b/.test(fullText);
-  const rowCount = continuationPage ? 15 : 32;
+async function recognizeImageTableRows(canvas, worker, fullText, pageIndex, expectedRows = null) {
+  const continuationPage = expectedRows === 15 || (!expectedRows && !/FORMUL|EXTRAÇÃO|EXTRACAO/i.test(fullText) && /\b3[3-9]\b/.test(fullText));
+  const rowCount = expectedRows || (continuationPage ? 15 : 32);
   const startRatio = continuationPage ? 0.082 : 0.392;
   const endRatio = continuationPage ? 0.337 : 0.91;
   const xStart = continuationPage ? 0.09 : 0.10;
@@ -387,7 +447,9 @@ async function recognizeImageTableRows(canvas, worker, fullText, pageIndex) {
     tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
   });
   for (let index = 0; index < rowCount; index += 1) {
-    $('import-status').textContent = `Lendo linha ${index + 1} de ${rowCount} da imagem...`;
+    const progressMessage = `Lendo linha ${index + 1} de ${rowCount} da fotografia...`;
+    if ($('scanner-dialog').open && cameraMode === 'form') $('scanner-message').textContent = progressMessage;
+    else $('import-status').textContent = progressMessage;
     const rowY = canvas.height * (startRatio + spacing * index);
     const strip = makePrintedRowStrip(canvas, xStart, xEnd, rowY, canvas.height * spacing * 0.72);
     const result = await worker.recognize(strip, {}, { text: true });
@@ -463,7 +525,9 @@ async function recognizeHandwrittenFields(canvas, rows, worker, pageIndex) {
   assignMissingRowPositions(rows, canvas.height, pageIndex);
   const rowYs = rows.map((row) => row.rowY).filter(Number.isFinite);
   if (!rowYs.length) return;
-  $('import-status').textContent = `Lendo valores manuscritos da página ${pageIndex + 1}...`;
+  const handwritingMessage = `Lendo valores manuscritos da página ${pageIndex + 1}...`;
+  if ($('scanner-dialog').open && cameraMode === 'form') $('scanner-message').textContent = handwritingMessage;
+  else $('import-status').textContent = handwritingMessage;
   const minY = Math.max(0, Math.min(...rowYs) - canvas.height * 0.012);
   const maxY = Math.min(canvas.height, Math.max(...rowYs) + canvas.height * 0.012);
   const crop = makeHandwritingMask(canvas, 0.43, 0.97, minY, maxY);
