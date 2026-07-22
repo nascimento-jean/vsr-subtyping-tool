@@ -105,8 +105,8 @@ document.querySelector('#app').innerHTML = `
 
 document.body.insertAdjacentHTML('beforeend', `
   <dialog id="review-dialog" class="review-dialog">
-    <div class="review-header"><div><h2>Conferir dados reconhecidos</h2><p>Corrija os campos destacados ou lidos incorretamente antes de continuar.</p></div><button id="close-review" aria-label="Fechar">×</button></div>
-    <div class="review-table-wrap"><table class="review-table"><thead><tr><th>Nº</th><th>Registro/GAL</th><th>Nome</th><th>CT VSR-A</th><th>CT VSR-B</th><th>Resultado</th></tr></thead><tbody id="review-body"></tbody></table></div>
+    <div class="review-header"><div><h2>Conferir dados reconhecidos <span id="review-count"></span></h2><p>Corrija os campos ou exclua as linhas reconhecidas incorretamente antes de continuar.</p></div><button id="close-review" aria-label="Fechar">×</button></div>
+    <div class="review-table-wrap"><table class="review-table"><thead><tr><th>Nº</th><th>Registro/GAL</th><th>Nome</th><th>CT VSR-A</th><th>CT VSR-B</th><th>Resultado</th><th>Ação</th></tr></thead><tbody id="review-body"></tbody></table></div>
     <div class="review-actions"><button id="cancel-import" class="retry-button">Cancelar</button><button id="confirm-import" class="confirm-button">Adicionar à execução</button></div>
   </dialog>`);
 
@@ -486,6 +486,7 @@ function deduplicateImportedRows(rows) {
 }
 
 function renderReviewRows() {
+  $('review-count').textContent = `(${importedRows.length})`;
   $('review-body').innerHTML = importedRows.map((row, index) => `<tr class="${row.uncertain ? 'uncertain-row' : ''}">
     <td>${index + 1}</td>
     <td><input data-index="${index}" data-field="gal" inputmode="numeric" value="${escapeHtml(row.gal)}"></td>
@@ -493,12 +494,19 @@ function renderReviewRows() {
     <td><input data-index="${index}" data-field="ctA" inputmode="decimal" value="${escapeHtml(row.ctA)}"></td>
     <td><input data-index="${index}" data-field="ctB" inputmode="decimal" value="${escapeHtml(row.ctB)}"></td>
     <td><select data-index="${index}" data-field="result"><option value=""></option><option value="A" ${row.result === 'A' ? 'selected' : ''}>A</option><option value="B" ${row.result === 'B' ? 'selected' : ''}>B</option></select></td>
+    <td><button class="delete-imported-row" data-delete-index="${index}" type="button" aria-label="Excluir linha ${index + 1}">Excluir</button></td>
   </tr>`).join('');
   $('review-body').querySelectorAll('input, select').forEach((input) => input.addEventListener('input', () => {
     const row = importedRows[Number(input.dataset.index)];
     row[input.dataset.field] = input.dataset.field === 'gal' ? cleanGal(input.value) : input.dataset.field.startsWith('ct') ? cleanCt(input.value) : input.value.toUpperCase();
     input.value = row[input.dataset.field];
   }));
+  $('review-body').querySelectorAll('.delete-imported-row').forEach((button) => button.addEventListener('click', () => {
+    importedRows.splice(Number(button.dataset.deleteIndex), 1);
+    renderReviewRows();
+  }));
+  $('confirm-import').textContent = importedRows.length ? `Adicionar ${importedRows.length} à execução` : 'Nenhuma linha para adicionar';
+  $('confirm-import').disabled = importedRows.length === 0;
 }
 
 function confirmImportedRows() {

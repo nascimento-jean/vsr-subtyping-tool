@@ -50,11 +50,14 @@ dialog { width: min(560px, calc(100% - 20px)); padding: 0; border: 0; border-rad
 .review-header { display: flex; justify-content: space-between; gap: 15px; padding: 18px; border-bottom: 1px solid #dbe4ec; }
 .review-header h2 { margin-bottom: 4px; }.review-header p { margin: 0; color: #64748b; font-size: 12px; }.review-header button { align-self: start; border: 0; color: #64748b; background: transparent; font-size: 28px; }
 .review-table-wrap { max-height: 62vh; overflow: auto; }
-.review-table { width: 100%; min-width: 760px; border-collapse: collapse; }
+.review-table { width: 100%; min-width: 850px; border-collapse: collapse; }
 .review-table th { position: sticky; top: 0; z-index: 1; padding: 10px 7px; color: white; background: #075985; font-size: 11px; text-align: left; }
 .review-table td { padding: 5px; border-bottom: 1px solid #e2e8f0; }.review-table td:first-child { text-align: center; }
 .review-table input, .review-table select { height: 38px; min-width: 80px; border-radius: 7px; padding: 0 7px; }
 .review-table select { width: 100%; border: 1px solid #c9d6e0; background: white; }
+.delete-imported-row { min-height: 36px; border: 1px solid #fecaca; border-radius: 7px; padding: 0 9px; color: #b91c1c; background: #fff1f2; font-size: 11px; font-weight: 800; }
+.delete-imported-row:active { background: #ffe4e6; }
+.review-header h2 span { color: #64748b; font-size: 14px; font-weight: 700; }
 .uncertain-row { background: #fffbeb; }.uncertain-row input, .uncertain-row select { border-color: #f59e0b; }
 .review-actions { display: grid; grid-template-columns: 1fr 1.5fr; gap: 10px; padding: 15px 18px calc(15px + env(safe-area-inset-bottom)); border-top: 1px solid #dbe4ec; }
 .review-actions button { min-height: 46px; border: 0; border-radius: 10px; font-weight: 800; }
