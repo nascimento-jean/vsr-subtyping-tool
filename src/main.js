@@ -2,7 +2,11 @@ import { BrowserMultiFormatReader } from '@zxing/browser';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { createWorker, PSM } from 'tesseract.js';
+import * as pdfjsLib from 'pdfjs-dist';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import './style.css';
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const STORAGE_KEY = 'vsr-subtyping-tool-run-v2';
 const dateNow = () => new Date().toLocaleDateString('pt-BR');
@@ -12,6 +16,7 @@ let scannerControls = null;
 let cameraStream = null;
 let ocrWorker = null;
 let deferredInstallPrompt = null;
+let importedRows = [];
 
 document.querySelector('#app').innerHTML = `
   <header class="topbar">
@@ -20,8 +25,16 @@ document.querySelector('#app').innerHTML = `
   </header>
   <main>
     <section class="hero">
-      <div><p class="eyebrow">LACEN/AL</p><h1>Subtipagem de VSR</h1><p>Registre o GAL, informe os CTs e gere o relatório em PDF.</p></div>
+      <div><p class="eyebrow">LACEN/AL</p><h1>Subtipagem de VSR</h1><p>Registre o GAL, importe formulários e gere relatórios em PDF ou Excel.</p></div>
       <div class="sample-count"><strong id="sample-count">0</strong><span>amostras</span></div>
+    </section>
+
+    <section class="panel import-panel">
+      <div class="section-heading"><div><span class="step">2</span><h2>Importar formulário preenchido</h2></div><span class="local-badge">Processamento local</span></div>
+      <p class="panel-description">Escolha uma fotografia ou um PDF digitalizado. No PDF, cada página é convertida automaticamente em imagem antes da leitura.</p>
+      <input id="form-file" class="file-input" type="file" accept="image/*,.pdf,application/pdf" />
+      <button id="import-form-button" class="primary-button import-button">Reconhecer imagem ou PDF</button>
+      <p id="import-status" class="import-status hidden"></p>
     </section>
 
     <section class="panel">
@@ -90,6 +103,13 @@ document.querySelector('#app').innerHTML = `
     <ol><li>Abra esta página no <strong>Safari</strong>.</li><li>Toque no botão <strong>Compartilhar</strong>.</li><li>Escolha <strong>Adicionar à Tela de Início</strong>.</li><li>Confirme em <strong>Adicionar</strong>.</li></ol>
   </dialog>`;
 
+document.body.insertAdjacentHTML('beforeend', `
+  <dialog id="review-dialog" class="review-dialog">
+    <div class="review-header"><div><h2>Conferir dados reconhecidos</h2><p>Corrija os campos destacados ou lidos incorretamente antes de continuar.</p></div><button id="close-review" aria-label="Fechar">×</button></div>
+    <div class="review-table-wrap"><table class="review-table"><thead><tr><th>Nº</th><th>Registro/GAL</th><th>Nome</th><th>CT VSR-A</th><th>CT VSR-B</th><th>Resultado</th></tr></thead><tbody id="review-body"></tbody></table></div>
+    <div class="review-actions"><button id="cancel-import" class="retry-button">Cancelar</button><button id="confirm-import" class="confirm-button">Adicionar à execução</button></div>
+  </dialog>`);
+
 function field(id, label, inputmode = 'text', placeholder = '') {
   return `<div class="field"><label for="${id}">${label}</label><input id="${id}" inputmode="${inputmode}" placeholder="${placeholder}" /></div>`;
 }
@@ -108,7 +128,7 @@ Object.entries(fields).forEach(([key, input]) => {
 const cleanGal = (value) => value.replace(/\D/g, '');
 const cleanCt = (value) => value.replace(',', '.').replace(/[^0-9.]/g, '');
 const detected = (value) => value !== '' && Number.isFinite(Number(value)) && Number(value) > 0;
-const resultFor = ({ ctA, ctB }) => detected(ctA) && detected(ctB) ? 'VSR-A/VSR-B' : detected(ctA) ? 'VSR-A' : detected(ctB) ? 'VSR-B' : 'Não detectado';
+const resultFor = ({ ctA, ctB, manualResult }) => manualResult === 'A' ? 'VSR-A' : manualResult === 'B' ? 'VSR-B' : detected(ctA) && detected(ctB) ? 'VSR-A/VSR-B' : detected(ctA) ? 'VSR-A' : detected(ctB) ? 'VSR-B' : 'Não detectado';
 
 $('gal').addEventListener('input', (event) => {
   event.target.value = cleanGal(event.target.value);
@@ -133,7 +153,7 @@ function renderSamples() {
   $('sample-list').innerHTML = run.samples.length ? run.samples.map((sample, index) => `
     <article class="sample-card">
       <span class="number">${index + 1}</span>
-      <div><strong>GAL ${sample.gal}</strong><p>VSR-A: ${sample.ctA || '-'} · VSR-B: ${sample.ctB || '-'}</p><span class="result">${resultFor(sample)}</span></div>
+      <div><strong>GAL ${sample.gal}${sample.name ? ` · ${escapeHtml(sample.name)}` : ''}</strong><p>VSR-A: ${sample.ctA || '-'} · VSR-B: ${sample.ctB || '-'}</p><span class="result">${resultFor(sample)}</span></div>
       <button class="delete-sample" data-id="${sample.id}">Excluir</button>
     </article>`).join('') : `<div class="empty-state"><strong>Nenhuma amostra registrada</strong><span>Leia um código GAL ou digite-o para começar.</span></div>`;
   document.querySelectorAll('.delete-sample').forEach((button) => button.addEventListener('click', () => {
@@ -246,6 +266,189 @@ function stopScanner() {
   $('scanner-dialog').close();
 }
 
+$('import-form-button').addEventListener('click', importFilledForm);
+$('close-review').addEventListener('click', closeReview);
+$('cancel-import').addEventListener('click', closeReview);
+$('confirm-import').addEventListener('click', confirmImportedRows);
+
+async function importFilledForm() {
+  const file = $('form-file').files[0];
+  if (!file) return alert('Escolha uma imagem ou um arquivo PDF.');
+  const button = $('import-form-button');
+  const status = $('import-status');
+  button.disabled = true;
+  status.classList.remove('hidden');
+  importedRows = [];
+  try {
+    const pages = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+      ? await pdfToCanvases(file, status)
+      : [await imageFileToCanvas(file)];
+    for (let index = 0; index < pages.length; index += 1) {
+      status.textContent = `Lendo página ${index + 1} de ${pages.length}...`;
+      const rows = await recognizeFormPage(pages[index], index);
+      importedRows.push(...rows);
+    }
+    importedRows = deduplicateImportedRows(importedRows);
+    if (!importedRows.length) throw new Error('Nenhum registro foi identificado.');
+    renderReviewRows();
+    $('review-dialog').showModal();
+    status.textContent = `${importedRows.length} registro(s) localizado(s). Confira os dados.`;
+  } catch (error) {
+    console.error(error);
+    status.textContent = `Não foi possível concluir a leitura: ${error.message || 'tente outra imagem.'}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function pdfToCanvases(file, status) {
+  status.textContent = 'Convertendo o PDF em imagens...';
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+  const canvases = [];
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    status.textContent = `Convertendo página ${pageNumber} de ${pdf.numPages} em imagem...`;
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale: 2.2 });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    canvases.push(canvas);
+  }
+  return canvases;
+}
+
+function imageFileToCanvas(file) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const url = URL.createObjectURL(file);
+    image.onload = () => {
+      const maxWidth = 2400;
+      const scale = Math.min(1, maxWidth / image.naturalWidth);
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(image.naturalWidth * scale);
+      canvas.height = Math.round(image.naturalHeight * scale);
+      canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas);
+    };
+    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Imagem inválida.')); };
+    image.src = url;
+  });
+}
+
+async function getOcrWorker() {
+  if (ocrWorker) return ocrWorker;
+  ocrWorker = await createWorker('eng', 1, { logger: ({ status, progress }) => {
+    if (status === 'recognizing text') $('import-status').textContent = `Reconhecendo texto... ${Math.round(progress * 100)}%`;
+  }});
+  return ocrWorker;
+}
+
+async function recognizeFormPage(canvas, pageIndex) {
+  const worker = await getOcrWorker();
+  await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT });
+  const result = await worker.recognize(canvas, {}, { blocks: true, text: true });
+  const words = flattenOcrWords(result.data.blocks || []);
+  const rows = rowsFromPositionedWords(words, canvas.width, canvas.height, pageIndex);
+  return rows.length ? rows : rowsFromPlainText(result.data.text || '', pageIndex);
+}
+
+function flattenOcrWords(blocks) {
+  const words = [];
+  blocks.forEach((block) => (block.paragraphs || []).forEach((paragraph) =>
+    (paragraph.lines || []).forEach((line) => (line.words || []).forEach((word) => {
+      if (word.text?.trim() && word.bbox) words.push({ text: word.text.trim(), bbox: word.bbox, confidence: word.confidence || 0 });
+    }))));
+  return words;
+}
+
+function normalizedDigits(value) {
+  return value.toUpperCase().replace(/[OQD]/g, '0').replace(/[IL|]/g, '1').replace(/\D/g, '');
+}
+
+function rowsFromPositionedWords(words, width, height, pageIndex) {
+  const registrations = words.map((word) => ({ ...word, digits: normalizedDigits(word.text) }))
+    .filter((word) => word.digits.length >= 11 && word.digits.length <= 14 && word.bbox.x0 < width * 0.48);
+  return registrations.map((registration, index) => {
+    const centerY = (registration.bbox.y0 + registration.bbox.y1) / 2;
+    const tolerance = Math.max(12, height * 0.009);
+    const lineWords = words.filter((word) => {
+      const wordY = (word.bbox.y0 + word.bbox.y1) / 2;
+      return Math.abs(wordY - centerY) <= tolerance;
+    });
+    const inZone = (min, max) => lineWords.filter((word) => word.bbox.x0 >= width * min && word.bbox.x0 < width * max);
+    const name = inZone(0.22, 0.49).map((word) => word.text.replace(/[^A-Za-z]/g, '')).join('').toUpperCase().slice(0, 12);
+    const ctA = readCt(inZone(0.45, 0.63));
+    const ctB = readCt(inZone(0.60, 0.79));
+    const result = readResult(inZone(0.75, 0.96));
+    const confidence = Math.min(registration.confidence || 0, ...lineWords.map((word) => word.confidence || 0));
+    return { number: index + 1, gal: registration.digits, name, ctA, ctB, result, page: pageIndex + 1, uncertain: confidence < 65 || (!ctA && !ctB && !result) };
+  });
+}
+
+function readCt(words) {
+  const joined = words.map((word) => word.text).join('').replace(',', '.').replace(/[^0-9.]/g, '');
+  const match = joined.match(/(?:[1-4]?\d)[.]\d{1,2}/);
+  return match ? match[0] : '';
+}
+
+function readResult(words) {
+  const candidate = words.map((word) => word.text.toUpperCase().replace(/[^AB]/g, '')).find((value) => value === 'A' || value === 'B');
+  return candidate || '';
+}
+
+function rowsFromPlainText(text, pageIndex) {
+  const normalized = text.toUpperCase().replace(/[|]/g, ' ');
+  const pattern = /(\d{11,14})\s+([A-Z]{2,12})/g;
+  const rows = [];
+  let match;
+  while ((match = pattern.exec(normalized)) !== null) rows.push({ number: rows.length + 1, gal: match[1], name: match[2], ctA: '', ctB: '', result: '', page: pageIndex + 1, uncertain: true });
+  return rows;
+}
+
+function deduplicateImportedRows(rows) {
+  const seen = new Set();
+  return rows.filter((row) => row.gal && !seen.has(row.gal) && seen.add(row.gal)).map((row, index) => ({ ...row, number: index + 1 }));
+}
+
+function renderReviewRows() {
+  $('review-body').innerHTML = importedRows.map((row, index) => `<tr class="${row.uncertain ? 'uncertain-row' : ''}">
+    <td>${index + 1}</td>
+    <td><input data-index="${index}" data-field="gal" inputmode="numeric" value="${escapeHtml(row.gal)}"></td>
+    <td><input data-index="${index}" data-field="name" value="${escapeHtml(row.name)}"></td>
+    <td><input data-index="${index}" data-field="ctA" inputmode="decimal" value="${escapeHtml(row.ctA)}"></td>
+    <td><input data-index="${index}" data-field="ctB" inputmode="decimal" value="${escapeHtml(row.ctB)}"></td>
+    <td><select data-index="${index}" data-field="result"><option value=""></option><option value="A" ${row.result === 'A' ? 'selected' : ''}>A</option><option value="B" ${row.result === 'B' ? 'selected' : ''}>B</option></select></td>
+  </tr>`).join('');
+  $('review-body').querySelectorAll('input, select').forEach((input) => input.addEventListener('input', () => {
+    const row = importedRows[Number(input.dataset.index)];
+    row[input.dataset.field] = input.dataset.field === 'gal' ? cleanGal(input.value) : input.dataset.field.startsWith('ct') ? cleanCt(input.value) : input.value.toUpperCase();
+    input.value = row[input.dataset.field];
+  }));
+}
+
+function confirmImportedRows() {
+  const validRows = importedRows.filter((row) => row.gal.length >= 10);
+  let added = 0;
+  validRows.forEach((row) => {
+    if (run.samples.some((sample) => sample.gal === row.gal)) return;
+    run.samples.push({ id: crypto.randomUUID(), gal: row.gal, name: row.name, ctA: row.ctA, ctB: row.ctB, manualResult: row.result });
+    added += 1;
+  });
+  saveRun(); renderSamples(); closeReview();
+  alert(`${added} amostra(s) adicionada(s). Revise a lista e baixe o Excel quando estiver pronto.`);
+}
+
+function closeReview() {
+  if ($('review-dialog').open) $('review-dialog').close();
+}
+
+function escapeHtml(value = '') {
+  return String(value).replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
+}
+
 $('pdf-button').addEventListener('click', () => {
   if (!run.samples.length) return alert('Adicione ao menos uma amostra antes de gerar o PDF.');
   const doc = new jsPDF({ unit: 'mm', format: 'a4' });
@@ -256,7 +459,7 @@ $('pdf-button').addEventListener('click', () => {
   doc.text(`Kit de extração: ${run.extractionKit || '-'}`, 14, 30);
   doc.text(`Kit de PCR: ${run.pcrKit || '-'}`, 110, 30);
   doc.text(`Data de execução: ${run.executionDate || '-'}`, 14, 36);
-  autoTable(doc, { startY: 42, head: [['Nº', 'GAL', 'VSR-A (CT)', 'VSR-B (CT)', 'Resultado']], body: run.samples.map((s, i) => [i + 1, s.gal, s.ctA || '-', s.ctB || '-', resultFor(s)]), theme: 'grid', headStyles: { fillColor: [7, 89, 133] }, styles: { fontSize: 8, cellPadding: 2 } });
+  autoTable(doc, { startY: 42, head: [['Nº', 'GAL', 'Nome', 'VSR-A (CT)', 'VSR-B (CT)', 'Resultado']], body: run.samples.map((s, i) => [i + 1, s.gal, s.name || '-', s.ctA || '-', s.ctB || '-', resultFor(s)]), theme: 'grid', headStyles: { fillColor: [7, 89, 133] }, styles: { fontSize: 8, cellPadding: 2 } });
   const end = doc.lastAutoTable.finalY + 10;
   doc.text(`Extraído por: ${run.extractedBy || '-'}`, 14, end);
   doc.text(`Analisado por: ${run.analyzedBy || '-'}`, 14, end + 7);
@@ -281,22 +484,22 @@ async function exportExcel() {
       views: [{ state: 'frozen', ySplit: 7, showGridLines: false }],
       pageSetup: { orientation: 'landscape', paperSize: 9, fitToPage: true, fitToWidth: 1, fitToHeight: 0, margins: { left: 0.3, right: 0.3, top: 0.45, bottom: 0.45, header: 0.2, footer: 0.2 } },
     });
-    report.mergeCells('A1:E1');
+    report.mergeCells('A1:F1');
     report.getCell('A1').value = 'LABORATÓRIO CENTRAL DE SAÚDE PÚBLICA - LACEN/AL';
-    report.mergeCells('A2:E2');
+    report.mergeCells('A2:F2');
     report.getCell('A2').value = 'SUBTIPAGEM DE VÍRUS SINCICIAL RESPIRATÓRIO';
     report.getCell('A3').value = 'Kit de extração'; report.getCell('B3').value = run.extractionKit || '-';
     report.getCell('D3').value = 'Kit de PCR'; report.getCell('E3').value = run.pcrKit || '-';
     report.getCell('A4').value = 'Data de execução'; report.getCell('B4').value = run.executionDate || '-';
     report.getCell('D4').value = 'Total de amostras'; report.getCell('E4').value = run.samples.length;
-    report.getRow(7).values = ['Nº', 'GAL', 'VSR-A (CT)', 'VSR-B (CT)', 'Resultado'];
-    run.samples.forEach((sample, index) => report.addRow([index + 1, sample.gal, sample.ctA ? Number(sample.ctA) : null, sample.ctB ? Number(sample.ctB) : null, resultFor(sample)]));
+    report.getRow(7).values = ['Nº', 'GAL', 'Nome', 'VSR-A (CT)', 'VSR-B (CT)', 'Resultado'];
+    run.samples.forEach((sample, index) => report.addRow([index + 1, sample.gal, sample.name || '', sample.ctA ? Number(sample.ctA) : null, sample.ctB ? Number(sample.ctB) : null, resultFor(sample)]));
     const signatureStart = 8 + run.samples.length + 2;
     report.getCell(`A${signatureStart}`).value = 'Extraído por'; report.getCell(`B${signatureStart}`).value = run.extractedBy || '-';
     report.getCell(`A${signatureStart + 1}`).value = 'Analisado por'; report.getCell(`B${signatureStart + 1}`).value = run.analyzedBy || '-';
     report.getCell(`A${signatureStart + 2}`).value = 'Conferido por'; report.getCell(`B${signatureStart + 2}`).value = run.checkedBy || '-';
 
-    report.getColumn(1).width = 8; report.getColumn(2).width = 22; report.getColumn(3).width = 16; report.getColumn(4).width = 16; report.getColumn(5).width = 23;
+    report.getColumn(1).width = 8; report.getColumn(2).width = 22; report.getColumn(3).width = 16; report.getColumn(4).width = 16; report.getColumn(5).width = 16; report.getColumn(6).width = 23;
     ['A1', 'A2'].forEach((cell, index) => { report.getCell(cell).font = { bold: true, size: index === 0 ? 14 : 12, color: { argb: 'FF0F2940' } }; report.getCell(cell).alignment = { horizontal: 'center', vertical: 'middle' }; });
     report.getRow(1).height = 25; report.getRow(2).height = 22;
     ['A3', 'D3', 'A4', 'D4'].forEach((cell) => { report.getCell(cell).font = { bold: true, color: { argb: 'FF475569' } }; });
@@ -306,22 +509,22 @@ async function exportExcel() {
     for (let rowNumber = 8; rowNumber < 8 + run.samples.length; rowNumber += 1) {
       const row = report.getRow(rowNumber);
       row.eachCell((cell) => { cell.border = { bottom: { style: 'thin', color: { argb: 'FFD9E2EA' } } }; cell.alignment = { vertical: 'middle', horizontal: cell.col === 2 || cell.col === 5 ? 'left' : 'center' }; });
-      row.getCell(2).numFmt = '@'; row.getCell(3).numFmt = '0.00'; row.getCell(4).numFmt = '0.00';
+      row.getCell(2).numFmt = '@'; row.getCell(4).numFmt = '0.00'; row.getCell(5).numFmt = '0.00';
       if (rowNumber % 2 === 0) row.eachCell((cell) => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F7FA' } }; });
     }
-    report.autoFilter = { from: 'A7', to: `E${7 + run.samples.length}` };
-    report.printArea = `A1:E${signatureStart + 2}`;
+    report.autoFilter = { from: 'A7', to: `F${7 + run.samples.length}` };
+    report.printArea = `A1:F${signatureStart + 2}`;
 
     const data = workbook.addWorksheet('Dados', { views: [{ state: 'frozen', ySplit: 1 }] });
     data.columns = [
-      { header: 'Número', key: 'number', width: 10 }, { header: 'GAL', key: 'gal', width: 22 },
+      { header: 'Número', key: 'number', width: 10 }, { header: 'GAL', key: 'gal', width: 22 }, { header: 'Nome', key: 'name', width: 18 },
       { header: 'VSR-A_CT', key: 'ctA', width: 15 }, { header: 'VSR-B_CT', key: 'ctB', width: 15 },
       { header: 'Resultado', key: 'result', width: 22 }, { header: 'Data_execução', key: 'date', width: 18 },
     ];
-    run.samples.forEach((sample, index) => data.addRow({ number: index + 1, gal: sample.gal, ctA: sample.ctA ? Number(sample.ctA) : null, ctB: sample.ctB ? Number(sample.ctB) : null, result: resultFor(sample), date: run.executionDate }));
+    run.samples.forEach((sample, index) => data.addRow({ number: index + 1, gal: sample.gal, name: sample.name || '', ctA: sample.ctA ? Number(sample.ctA) : null, ctB: sample.ctB ? Number(sample.ctB) : null, result: resultFor(sample), date: run.executionDate }));
     data.getRow(1).eachCell((cell) => { cell.font = { bold: true, color: { argb: 'FFFFFFFF' } }; cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF075985' } }; });
     data.getColumn('gal').numFmt = '@'; data.getColumn('ctA').numFmt = '0.00'; data.getColumn('ctB').numFmt = '0.00';
-    data.autoFilter = { from: 'A1', to: `F${run.samples.length + 1}` };
+    data.autoFilter = { from: 'A1', to: `G${run.samples.length + 1}` };
 
     const buffer = await workbook.xlsx.writeBuffer();
     const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });

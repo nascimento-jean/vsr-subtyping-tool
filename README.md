@@ -50,6 +50,9 @@ Em alguns aparelhos, o próprio Chrome exibe automaticamente o botão **Instalar
 - armazenamento automático no próprio aparelho;
 - geração do relatório em PDF;
 - geração de planilha Excel com abas `Relatório` e `Dados`;
+- importação de fotografia ou PDF de formulário preenchido;
+- conversão automática de cada página do PDF em imagem no aparelho;
+- revisão dos registros, nomes, CTs e resultados antes da inclusão;
 - funcionamento sem cadastro de usuário.
 
 ## Privacidade e observações
