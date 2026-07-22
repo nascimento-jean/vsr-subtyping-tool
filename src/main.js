@@ -315,7 +315,10 @@ async function pdfToCanvases(file, status) {
     canvas.height = Math.round(viewport.height);
     await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
     const textContent = await page.getTextContent();
-    const textItems = textContent.items.map((item) => ({ text: item.str || '', x: item.transform?.[4] || 0, y: item.transform?.[5] || 0 }));
+    const textItems = textContent.items.map((item) => {
+      const position = pdfjsLib.Util.transform(viewport.transform, item.transform);
+      return { text: item.str || '', x: position[4], y: position[5] };
+    });
     const embeddedText = textItems.map((item) => item.text).join(' ');
     canvases.push({ canvas, embeddedText, textItems });
   }
@@ -367,7 +370,104 @@ async function recognizeFormPage(pageData, pageIndex) {
     ocrRows = [...ocrRows, ...rowsFromPlainText(secondPass.data.text || '', pageIndex)];
   }
 
-  return mergeRecognizedRows([...embeddedRows, ...ocrRows], positionedRows);
+  const mergedRows = mergeRecognizedRows([...embeddedRows, ...ocrRows], positionedRows);
+  await recognizeHandwrittenFields(canvas, mergedRows, worker, pageIndex);
+  return mergedRows;
+}
+
+async function recognizeHandwrittenFields(canvas, rows, worker, pageIndex) {
+  if (!rows.length) return;
+  assignMissingRowPositions(rows, canvas.height, pageIndex);
+  const rowYs = rows.map((row) => row.rowY).filter(Number.isFinite);
+  if (!rowYs.length) return;
+  $('import-status').textContent = `Lendo valores manuscritos da página ${pageIndex + 1}...`;
+  const minY = Math.max(0, Math.min(...rowYs) - canvas.height * 0.012);
+  const maxY = Math.min(canvas.height, Math.max(...rowYs) + canvas.height * 0.012);
+  const crop = makeHandwritingMask(canvas, 0.43, 0.97, minY, maxY);
+  await worker.setParameters({
+    tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+    tessedit_char_whitelist: '0123456789.,AB-',
+  });
+  const result = await worker.recognize(crop.canvas, {}, { blocks: true, text: true });
+  const words = flattenOcrWords(result.data.blocks || []).map((word) => ({
+    ...word,
+    sourceX: crop.x + ((word.bbox.x0 + word.bbox.x1) / 2) / crop.scale,
+    sourceY: crop.y + ((word.bbox.y0 + word.bbox.y1) / 2) / crop.scale,
+  }));
+  const rowSpacing = rowYs.length > 1 ? (Math.max(...rowYs) - Math.min(...rowYs)) / (rowYs.length - 1) : canvas.height * 0.02;
+  words.forEach((word) => {
+    const row = rows.reduce((closest, candidate) => Math.abs(candidate.rowY - word.sourceY) < Math.abs(closest.rowY - word.sourceY) ? candidate : closest, rows[0]);
+    if (Math.abs(row.rowY - word.sourceY) > Math.max(18, rowSpacing * 0.65)) return;
+    const xRatio = word.sourceX / canvas.width;
+    if (xRatio >= 0.43 && xRatio < 0.60 && !row.ctA) row.ctA = normalizeHandwrittenCt(word.text);
+    else if (xRatio >= 0.60 && xRatio < 0.75 && !row.ctB) row.ctB = normalizeHandwrittenCt(word.text);
+    else if (xRatio >= 0.75 && xRatio <= 0.97 && !row.result) row.result = readResult([word]);
+  });
+  rows.forEach((row) => {
+    if (!row.result && row.ctA && !row.ctB) row.result = 'A';
+    if (!row.result && row.ctB && !row.ctA) row.result = 'B';
+    if (row.ctA || row.ctB || row.result) row.uncertain = true;
+  });
+  await worker.setParameters({ tessedit_char_whitelist: '', tessedit_pageseg_mode: PSM.SPARSE_TEXT });
+}
+
+function assignMissingRowPositions(rows, height, pageIndex) {
+  const known = rows.filter((row) => Number.isFinite(row.rowY));
+  const isFirstPage = rows.length > 20 || pageIndex === 0;
+  const start = known.length ? known[0].rowY : height * (isFirstPage ? 0.395 : 0.078);
+  const end = known.length > 1 ? known[known.length - 1].rowY : height * (isFirstPage ? 0.91 : 0.34);
+  rows.forEach((row, index) => {
+    if (!Number.isFinite(row.rowY)) row.rowY = start + (end - start) * (rows.length === 1 ? 0 : index / (rows.length - 1));
+  });
+}
+
+function makeHandwritingMask(source, startRatio, endRatio, minY, maxY) {
+  const x = Math.round(source.width * startRatio);
+  const y = Math.round(minY);
+  const width = Math.round(source.width * (endRatio - startRatio));
+  const height = Math.max(1, Math.round(maxY - minY));
+  const scale = 1.7;
+  const raw = document.createElement('canvas');
+  raw.width = width; raw.height = height;
+  const rawContext = raw.getContext('2d', { willReadFrequently: true });
+  rawContext.drawImage(source, x, y, width, height, 0, 0, width, height);
+  let pixels = rawContext.getImageData(0, 0, width, height);
+  let bluePixels = 0;
+  for (let index = 0; index < pixels.data.length; index += 4) {
+    const red = pixels.data[index]; const green = pixels.data[index + 1]; const blue = pixels.data[index + 2];
+    const blueInk = blue - (red + green) / 2 > 7 && blue < 235;
+    if (blueInk) bluePixels += 1;
+    const value = blueInk ? 0 : 255;
+    pixels.data[index] = pixels.data[index + 1] = pixels.data[index + 2] = value;
+  }
+  if (bluePixels < width * height * 0.0003) {
+    rawContext.drawImage(source, x, y, width, height, 0, 0, width, height);
+    pixels = rawContext.getImageData(0, 0, width, height);
+    for (let index = 0; index < pixels.data.length; index += 4) {
+      const gray = pixels.data[index] * 0.299 + pixels.data[index + 1] * 0.587 + pixels.data[index + 2] * 0.114;
+      const value = gray < 155 ? 0 : 255;
+      pixels.data[index] = pixels.data[index + 1] = pixels.data[index + 2] = value;
+    }
+  }
+  rawContext.putImageData(pixels, 0, 0);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(width * scale); canvas.height = Math.round(height * scale);
+  const context = canvas.getContext('2d');
+  context.imageSmoothingEnabled = false;
+  context.drawImage(raw, 0, 0, canvas.width, canvas.height);
+  return { canvas, x, y, scale };
+}
+
+function normalizeHandwrittenCt(value) {
+  const normalized = value.replace(',', '.').replace(/[^0-9.]/g, '');
+  const decimal = normalized.match(/(?:[1-4]?\d)[.]\d{1,2}/)?.[0];
+  if (decimal) return decimal;
+  const digits = normalized.replace(/\D/g, '');
+  if (digits.length === 3 || digits.length === 4) {
+    const candidate = Number(`${digits.slice(0, -2)}.${digits.slice(-2)}`);
+    if (candidate >= 10 && candidate <= 45) return candidate.toFixed(2);
+  }
+  return '';
 }
 
 function rowsFromPdfItems(items, pageIndex) {
@@ -380,11 +480,11 @@ function rowsFromPdfItems(items, pageIndex) {
       if (gal.length >= 11) registrations.push({ ...item, gal });
     });
   });
-  registrations.sort((a, b) => b.y - a.y || a.x - b.x);
+  registrations.sort((a, b) => a.y - b.y || a.x - b.x);
   return registrations.map((registration, index) => {
     const sameLine = items.filter((item) => Math.abs(item.y - registration.y) < 7 && item.x > registration.x);
     const name = sameLine.map((item) => item.text.toUpperCase().replace(/[^A-Z]/g, '')).find((value) => value.length >= 2 && value.length <= 12) || '';
-    return { number: index + 1, gal: registration.gal, name, ctA: '', ctB: '', result: '', page: pageIndex + 1, uncertain: true, order: index };
+    return { number: index + 1, gal: registration.gal, name, ctA: '', ctB: '', result: '', page: pageIndex + 1, uncertain: true, order: index, rowY: registration.y };
   });
 }
 
@@ -433,7 +533,7 @@ function rowsFromPositionedWords(words, width, height, pageIndex) {
     const ctB = readCt(inZone(0.60, 0.79));
     const result = readResult(inZone(0.75, 0.96));
     const confidence = Math.min(registration.confidence || 0, ...lineWords.map((word) => word.confidence || 0));
-    return { number: index + 1, gal: registration.digits, name, ctA, ctB, result, page: pageIndex + 1, uncertain: confidence < 65 || (!ctA && !ctB && !result) };
+    return { number: index + 1, gal: registration.digits, name, ctA, ctB, result, page: pageIndex + 1, uncertain: confidence < 65 || (!ctA && !ctB && !result), rowY: centerY };
   });
 }
 
@@ -475,6 +575,7 @@ function mergeRecognizedRows(baseRows, positionedRows) {
     if (!current.ctA && row.ctA) current.ctA = row.ctA;
     if (!current.ctB && row.ctB) current.ctB = row.ctB;
     if (!current.result && row.result) current.result = row.result;
+    if (!Number.isFinite(current.rowY) && Number.isFinite(row.rowY)) current.rowY = row.rowY;
     current.uncertain = current.uncertain && row.uncertain;
   });
   return [...byGal.values()].sort((a, b) => (a.page || 0) - (b.page || 0) || (a.order ?? a.number ?? 0) - (b.order ?? b.number ?? 0));
